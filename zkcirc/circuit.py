@@ -21,6 +21,11 @@ from dataclasses import dataclass, field
 from typing import Mapping
 
 from .field import P, parse_scalar
+from .field import (
+    check_width,
+    signed_range,
+    signed_to_bits,
+)
 from .errors import (
     CircuitBuildError,
     CircuitLimitError,
@@ -30,6 +35,7 @@ from .errors import (
     UnexpectedInputError,
     NonBooleanSelectError,
     AssertEqualError,
+    SignedInputError,
 )
 
 MAX_NODES = 200
@@ -40,8 +46,24 @@ _ADD = "add"
 _MUL = "mul"
 _SELECT = "select"
 _ASSERT = "assert_equal"
+# 2..8 位有符号整数（二补码）族节点。
+_SIGNED_INPUT = "signed_input"
+_SIGNED_CONST = "signed_const"
+_SADD = "sadd"
+_SSUB = "ssub"
+_SLT = "slt"   # 有符号 a < b，输出 0/1
+_SLE = "sle"   # 有符号 a <= b，输出 0/1
+_SEQ = "seq"   # 有符号 a == b，输出 0/1
 
-_VALID_KINDS = frozenset({_CONST, _INPUT, _ADD, _MUL, _SELECT, _ASSERT})
+# 带 w 位二补码数据的节点（可作为有符号运算/比较的操作数）。
+_SIGNED_VALUE_KINDS = frozenset(
+    {_SIGNED_INPUT, _SIGNED_CONST, _SADD, _SSUB}
+)
+
+_VALID_KINDS = frozenset({
+    _CONST, _INPUT, _ADD, _MUL, _SELECT, _ASSERT,
+    _SIGNED_INPUT, _SIGNED_CONST, _SADD, _SSUB, _SLT, _SLE, _SEQ,
+})
 # 每种节点的子节点引用个数。
 _ARITY = {
     _CONST: 0,
@@ -50,6 +72,13 @@ _ARITY = {
     _MUL: 2,
     _SELECT: 3,
     _ASSERT: 2,
+    _SIGNED_INPUT: 0,
+    _SIGNED_CONST: 0,
+    _SADD: 2,
+    _SSUB: 2,
+    _SLT: 2,
+    _SLE: 2,
+    _SEQ: 2,
 }
 
 
@@ -68,12 +97,57 @@ class Node:
         - "add"/"mul":    二元算术，inputs=(x, y) 为被引用节点的下标
         - "select":       inputs=(b, x, y)，b 非 0/1 时见证生成失败
         - "assert_equal": inputs=(x, y)，x!=y 时见证生成失败；输出值取 x
+        - "signed_input": 2..8 位有符号命名输入，width 为位宽，
+                          合法值 [-2**(w-1), 2**(w-1)-1]
+        - "signed_const": 同范围有符号常量，value 为其有符号 int 值
+        - "sadd"/"ssub":  w 位有符号加/减，溢出仅回绕
+        - "slt"/"sle"/"seq": 有符号 < / <= / ==，输出 0/1 标志
     """
 
     kind: str
     value: int | None = None
     inputs: tuple[int, ...] = ()
     name: str | None = None
+    width: int | None = None
+
+
+@dataclass(frozen=True)
+class SignedLayout:
+    """一个 w 位有符号「值」节点的见证槽布局（源码映射）。
+
+    bit_slots:  小端 w 个比特槽（bit_slots[0]=LSB，末位即符号位），
+                每个槽被布尔性约束钉在 {0,1}。
+    carry_slots: 仅 sadd/ssub 非空：w+1 个进位/借位槽，carry_slots[0]
+                被钉为 0，逐位全加/全减约束钉住其余。
+    word_slot:  该节点的主槽（= 旧意义上的节点槽），存放比特拼出的
+                二补码无符号字 Σ 2**i·b_i mod 97，由线性组合约束钉住。
+    """
+
+    node: int
+    width: int
+    bit_slots: tuple[int, ...]
+    carry_slots: tuple[int, ...]
+    word_slot: int
+
+
+@dataclass(frozen=True)
+class SignedCmpLayout:
+    """有符号比较节点（slt/sle/seq）的见证槽布局。
+
+    flag_slot:  节点主槽，比较结果 0/1。
+    diff_bits/borrows: slt/sle 使用的内部 w 位差值与 w+1 个借位。
+    eq_prod/eq_chain:  seq 使用的逐位乘积辅助 t_i 与 w 个链辅助
+                （链尾即 flag_slot）。
+    """
+
+    node: int
+    width: int
+    op: str  # "slt" | "sle" | "seq"
+    flag_slot: int
+    diff_bits: tuple[int, ...]
+    borrows: tuple[int, ...]
+    eq_prod: tuple[int, ...]
+    eq_chain: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -108,6 +182,13 @@ class CompiledCircuit:
     sources: tuple[VariableInfo, ...]
     inputs: Mapping[str, int]
     nodes: tuple[Node, ...]
+    # 有符号能力新增（旧字段语义全部不变）：
+    # 普通输入（input）与有符号输入（signed_input）名空间共用、
+    # 都登记在 inputs 中；signed_inputs 只列出有符号输入的额外元信息。
+    signed_inputs: Mapping[str, int] = field(default_factory=dict)
+    # 节点下标 -> 有符号值/比较节点的逐位槽位布局（源码映射）。
+    signed_layouts: Mapping[int, SignedLayout] = field(default_factory=dict)
+    signed_cmp_layouts: Mapping[int, SignedCmpLayout] = field(default_factory=dict)
 
     def source_of(self, slot: int) -> VariableInfo:
         return self.sources[slot]
@@ -152,7 +233,10 @@ class Circuit:
 
     def __init__(self) -> None:
         self._nodes: list[Node] = []
+        # 普通输入与有符号输入共用同一名字空间。
         self._input_names: set[str] = set()
+        # 有符号值节点（signed_input/signed_const/sadd/ssub）的位宽登记。
+        self._width_of: dict[int, int] = {}
 
     # -- 基础属性 -----------------------------------------------------------
 
@@ -213,6 +297,97 @@ class Circuit:
         self._check_ref(x, "assert_equal x")
         self._check_ref(y, "assert_equal y")
         return self._append(Node(_ASSERT, inputs=(x, y)))
+
+    # -- 2..8 位有符号整数 --------------------------------------------------
+
+    def signed_input(self, name: str, width: int) -> int:
+        """追加 w 位有符号命名输入（二补码）。
+
+        合法值闭区间 [-2**(w-1), 2**(w-1)-1]，w∈[2,8]。见证生成时调用方
+        仍只按名字给一个普通 Python int；越界/类型非法都会被明确拒绝。
+        """
+
+        w = check_width(width)
+        if not isinstance(name, str):
+            raise TypeError(f"input name must be str, got {type(name).__name__}")
+        if len(name) == 0:
+            raise ValueError("input name must be a non-empty string")
+        if name in self._input_names:
+            raise CircuitBuildError(f"duplicate input name: {name!r}")
+        index = self._append(Node(_SIGNED_INPUT, name=name, width=w))
+        self._input_names.add(name)
+        self._width_of[index] = w
+        return index
+
+    def signed_const(self, value: int, width: int) -> int:
+        """追加 w 位有符号常量；value 必须落在该位宽区间内（不静默回绕）。"""
+
+        w = check_width(width)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(
+                f"signed const value must be int, got {type(value).__name__}"
+            )
+        low, high = signed_range(w)
+        if not (low <= value <= high):
+            raise ValueError(
+                f"signed const value {value} out of range [{low}, {high}] "
+                f"for width {w}"
+            )
+        index = self._append(Node(_SIGNED_CONST, value=value, width=w))
+        self._width_of[index] = w
+        return index
+
+    def sadd(self, x: int, y: int) -> int:
+        """w 位有符号加法（溢出仅按二补码回绕）；x、y 必须同宽。"""
+
+        return self._signed_binop(_SADD, x, y)
+
+    def ssub(self, x: int, y: int) -> int:
+        """w 位有符号减法（溢出仅按二补码回绕）；x、y 必须同宽。"""
+
+        return self._signed_binop(_SSUB, x, y)
+
+    def slt(self, x: int, y: int) -> int:
+        """有符号比较 x < y；输出一个被布尔性约束钉住的 0/1 标志节点。"""
+
+        return self._signed_binop(_SLT, x, y)
+
+    def sle(self, x: int, y: int) -> int:
+        """有符号比较 x <= y；输出 0/1 标志节点。"""
+
+        return self._signed_binop(_SLE, x, y)
+
+    def seq(self, x: int, y: int) -> int:
+        """有符号比较 x == y；输出 0/1 标志节点。"""
+
+        return self._signed_binop(_SEQ, x, y)
+
+    def _signed_binop(self, kind: str, x: int, y: int) -> int:
+        what = kind
+        self._check_ref(x, f"{what} x")
+        self._check_ref(y, f"{what} y")
+        wx = self._width_of.get(x)
+        wy = self._width_of.get(y)
+        if wx is None:
+            raise CircuitBuildError(
+                f"{what} operand x (node {x}) is not a signed value node "
+                f"(signed_input/signed_const/sadd/ssub)"
+            )
+        if wy is None:
+            raise CircuitBuildError(
+                f"{what} operand y (node {y}) is not a signed value node "
+                f"(signed_input/signed_const/sadd/ssub)"
+            )
+        if wx != wy:
+            raise CircuitBuildError(
+                f"{what} operands must have equal signed width, got "
+                f"node {x} width {wx} and node {y} width {wy}"
+            )
+        index = self._append(Node(kind, inputs=(x, y), width=wx))
+        # sadd/ssub 的结果仍是同宽有符号值；比较结果是 0/1 标志，不登记。
+        if kind in (_SADD, _SSUB):
+            self._width_of[index] = wx
+        return index
 
     # -- 内部 ---------------------------------------------------------------
 
@@ -280,37 +455,153 @@ def compile_circuit(circuit: Circuit) -> CompiledCircuit:
                     f"node {i} references {ref}; references must point to an "
                     f"earlier node in [0, {i})"
                 )
+        if node.kind in (_SADD, _SSUB, _SLT, _SLE, _SEQ):
+            x, y = node.inputs
+            kx, ky = nodes[x].kind, nodes[y].kind
+            if kx not in _SIGNED_VALUE_KINDS or ky not in _SIGNED_VALUE_KINDS:
+                raise CompileError(
+                    f"node {i} ({node.kind}) operands must be signed value "
+                    f"nodes, got {kx!r}/{ky!r}"
+                )
+            if nodes[x].width != node.width or nodes[y].width != node.width:
+                raise CompileError(
+                    f"node {i} ({node.kind}) operand width mismatch"
+                )
+        if node.kind in (_SIGNED_INPUT, _SIGNED_CONST, _SADD, _SSUB):
+            if node.width is None:
+                raise CompileError(f"node {i} ({node.kind}) missing width")
+        if node.kind == _SIGNED_CONST:
+            low, high = signed_range(node.width)  # type: ignore[arg-type]
+            if not (low <= (node.value or 0) <= high):
+                raise CompileError(
+                    f"node {i} signed_const value out of range"
+                )
 
     # -- 槽位分配（节点下标顺序即拓扑序）------------------------------------
+    #
+    # 普通非常量节点各占 1 个主槽。有符号节点展开为多个见证槽：
+    #   signed_input : w 个比特槽 + 1 个字槽（字槽登记为命名输入槽）
+    #   signed_const : 不占槽（比特/字都以内联常数出现，沿用「常量不占槽」）
+    #   sadd/ssub    : w 个结果比特槽 + w+1 个进位/借位槽 + 1 个字槽
+    #   slt/sle      : w 个差值比特槽 + w+1 个借位槽 + 1 个标志槽
+    #   seq          : w 个逐位同或槽 + w 个链槽（链尾即标志槽）
     slot_of: dict[int, int] = {}
+    main_slot: dict[int, int] = {}
     sources: list[VariableInfo] = [
         VariableInfo(0, "constant_one", None, None, None)
     ]
     input_slots: dict[str, int] = {}
+    signed_input_widths: dict[str, int] = {}
+    signed_layouts: dict[int, SignedLayout] = {}
+    signed_cmp_layouts: dict[int, SignedCmpLayout] = {}
     next_slot = 1
-    for i, node in enumerate(nodes):
-        if node.kind == _CONST:
-            continue
-        slot_of[i] = next_slot
-        role = "input" if node.kind == _INPUT else "intermediate"
-        sources.append(VariableInfo(next_slot, role, i, node.name, node.kind))
-        if node.kind == _INPUT:
-            assert node.name is not None
-            input_slots[node.name] = next_slot
+
+    def alloc(role: str, node_id: int, name: str | None,
+              kind: str) -> int:
+        nonlocal next_slot
+        s = next_slot
+        sources.append(VariableInfo(s, role, node_id, name, kind))
         next_slot += 1
+        return s
+
+    for i, node in enumerate(nodes):
+        if node.kind in (_CONST, _SIGNED_CONST):
+            continue  # 常量不占槽
+        w = node.width
+        if node.kind == _SIGNED_INPUT:
+            assert w is not None and node.name is not None
+            bit_slots = tuple(
+                alloc("intermediate", i, node.name, "signed_bit")
+                for _ in range(w)
+            )
+            word = alloc("input", i, node.name, "signed_word")
+            slot_of[i] = word
+            main_slot[i] = word
+            input_slots[node.name] = word
+            signed_input_widths[node.name] = w
+            signed_layouts[i] = SignedLayout(i, w, bit_slots, (), word)
+        elif node.kind in (_SADD, _SSUB):
+            assert w is not None
+            bit_slots = tuple(
+                alloc("intermediate", i, None, "signed_bit") for _ in range(w)
+            )
+            carry_slots = tuple(
+                alloc("intermediate", i, None, "signed_carry")
+                for _ in range(w + 1)
+            )
+            word = alloc("intermediate", i, None, "signed_word")
+            slot_of[i] = word
+            main_slot[i] = word
+            signed_layouts[i] = SignedLayout(i, w, bit_slots, carry_slots, word)
+        elif node.kind in (_SLT, _SLE):
+            assert w is not None
+            diff_bits = tuple(
+                alloc("intermediate", i, None, "signed_diff_bit")
+                for _ in range(w)
+            )
+            borrows = tuple(
+                alloc("intermediate", i, None, "signed_borrow")
+                for _ in range(w + 1)
+            )
+            flag = alloc("intermediate", i, None, "signed_flag")
+            main_slot[i] = flag
+            signed_cmp_layouts[i] = SignedCmpLayout(
+                i, w, node.kind, flag, diff_bits, borrows, (), ()
+            )
+        elif node.kind == _SEQ:
+            assert w is not None
+            eq_prod = tuple(
+                alloc("intermediate", i, None, "signed_eq_prod")
+                for _ in range(w)
+            )
+            eq_chain = tuple(
+                alloc("intermediate", i, None, "signed_eq_chain")
+                for _ in range(w)
+            )
+            main_slot[i] = eq_chain[-1]
+            signed_cmp_layouts[i] = SignedCmpLayout(
+                i, w, node.kind, eq_chain[-1], (), (), eq_prod, eq_chain
+            )
+        else:
+            s = alloc(
+                "input" if node.kind == _INPUT else "intermediate",
+                i, node.name, node.kind,
+            )
+            slot_of[i] = s
+            main_slot[i] = s
+            if node.kind == _INPUT:
+                assert node.name is not None
+                input_slots[node.name] = s
 
     # -- 逐节点生成约束 ------------------------------------------------------
     #
     # 常量节点不占见证槽：在约束中把它内联为常数槽 0 上的系数。
-    # lin(i) 表示「节点 i 的值」的线性项：常量 -> {0: 值}，其余 -> {槽: 1}。
-    const_value: dict[int, int] = {
-        i: nd.value for i, nd in enumerate(nodes) if nd.kind == _CONST
-    }
+    # 普通 const 的字值模 97；signed_const 的「字」是其二补码无符号表示
+    # (value mod 2**w)，与比特槽拼出的字口径一致。
+    const_value: dict[int, int] = {}
+    for i, nd in enumerate(nodes):
+        if nd.kind == _CONST:
+            const_value[i] = nd.value % P  # type: ignore[operator]
+        elif nd.kind == _SIGNED_CONST:
+            w = nd.width
+            assert w is not None
+            const_value[i] = nd.value % (1 << w)  # type: ignore[operator]
 
     def lin(node_id: int) -> dict[int, int]:
         if node_id in const_value:
             return {0: const_value[node_id]}
-        return {slot_of[node_id]: 1}
+        return {main_slot[node_id]: 1}
+
+    def sbit(node_id: int, k: int) -> dict[int, int]:
+        """有符号值节点 node_id 的第 k 位（小端）线性项。
+
+        signed_const 的位是字面 0/1，内联在常数槽上；其余取比特见证槽。
+        """
+
+        nd = nodes[node_id]
+        if nd.kind == _SIGNED_CONST:
+            return {0: (nd.value >> k) & 1}  # type: ignore[operator]
+        return {signed_layouts[node_id].bit_slots[k]: 1}
 
     def merge(*parts: tuple[Mapping[int, int], int]) -> dict[int, int]:
         """合并若干 (线性项, 正负号)，系数可抵消，零值交由 _sparse 剔除。"""
@@ -337,6 +628,15 @@ def compile_circuit(circuit: Circuit) -> CompiledCircuit:
                 c=_sparse(c),
             )
         )
+
+    def bool_pin(node_id: int, tag: str, slot: int, what: str) -> None:
+        """发一条 b*(b-1)=0，把见证槽钉在 {0,1}。"""
+
+        emit(node_id, tag, f"node {node_id}: {what} booleanity b*(b-1)=0",
+             {slot: 1}, merge(({slot: 1}, 1), ({0: 1}, -1)), {})
+
+    def word_terms_of_bits(bit_slots: tuple[int, ...]) -> dict[int, int]:
+        return {bs: (1 << k) % P for k, bs in enumerate(bit_slots)}
 
     for i, node in enumerate(nodes):
         if node.kind == _ADD:
@@ -378,6 +678,115 @@ def compile_circuit(circuit: Circuit) -> CompiledCircuit:
             emit(i, "assert_equal",
                  f"assert_equal node {i}: x - y = 0",
                  merge((lin(x), 1), (lin(y), -1)), {0: 1}, {})
+        elif node.kind == _SIGNED_INPUT:
+            lay = signed_layouts[i]
+            for k, bs in enumerate(lay.bit_slots):
+                bool_pin(i, "sbit_booleanity", bs,
+                         f"input bit {k} (LSB=0)")
+            # 字槽 = Σ 2^k·b_k (mod 97)：字槽与逐位分解互相钉住。
+            emit(i, "signed_word",
+                 f"signed_input node {i}: word = sum 2^k * bit_k (mod {P})",
+                 {0: 1}, {lay.word_slot: 1}, word_terms_of_bits(lay.bit_slots))
+        elif node.kind in (_SADD, _SSUB):
+            lay = signed_layouts[i]
+            w = node.width
+            assert w is not None
+            x, y = node.inputs
+            is_add = node.kind == _SADD
+            carries = lay.carry_slots
+            emit(i, "signed_carry0",
+                 f"node {i}: {'carry' if is_add else 'borrow'}[0] = 0",
+                 {0: 1}, {carries[0]: 1}, {})
+            for k in range(w):
+                xk, yk = sbit(x, k), sbit(y, k)
+                ck, cn = {carries[k]: 1}, {carries[k + 1]: 1}
+                if is_add:
+                    # 全加器：s = x + y + c - 2c'；配 s、c' 的布尔性
+                    # 恰唯一确定标准进位；c_w 被丢弃即溢出回绕。
+                    rel = merge((xk, 1), (yk, 1), (ck, 1), (cn, -2))
+                    origin = f"node {i}: sadd bit {k} full-adder relation"
+                else:
+                    # 全减器：d = x - y - r + 2r'；配 d、r' 布尔性唯一确定借位。
+                    rel = merge((xk, 1), (yk, -1), (ck, -1), (cn, 2))
+                    origin = f"node {i}: ssub bit {k} full-subtractor relation"
+                emit(i, "sadd_bit" if is_add else "ssub_bit", origin,
+                     {0: 1}, {lay.bit_slots[k]: 1}, rel)
+                bool_pin(i, "sbit_booleanity", lay.bit_slots[k],
+                         f"result bit {k}")
+                bool_pin(i, "scarry_booleanity", carries[k + 1],
+                         f"{'carry' if is_add else 'borrow'} {k + 1}")
+            emit(i, "signed_word",
+                 f"node {i}: wrapped result word = sum 2^k * bit_k (mod {P})",
+                 {0: 1}, {lay.word_slot: 1},
+                 word_terms_of_bits(lay.bit_slots))
+        elif node.kind in (_SLT, _SLE):
+            lay = signed_cmp_layouts[i]
+            w = node.width
+            assert w is not None
+            x, y = node.inputs
+            # 有符号比较：翻转两数符号位后做 w 位无符号减法。
+            # slt: u_x - u_y，结果借位 r_w=1 当且仅当有符号 x<y。
+            # sle: u_y - u_x，r_w=1 当且仅当有符号 y<x，故 f = 1-r_w。
+            left, right = (x, y) if node.kind == _SLT else (y, x)
+
+            def ubit(operand: int, k: int) -> dict[int, int]:
+                if k == w - 1:
+                    return merge(({0: 1}, 1), (sbit(operand, k), -1))
+                return sbit(operand, k)
+
+            borrows = lay.borrows
+            emit(i, "signed_borrow0", f"node {i}: borrow[0] = 0",
+                 {0: 1}, {borrows[0]: 1}, {})
+            for k in range(w):
+                xk, yk = ubit(left, k), ubit(right, k)
+                rk, rn = {borrows[k]: 1}, {borrows[k + 1]: 1}
+                rel = merge((xk, 1), (yk, -1), (rk, -1), (rn, 2))
+                emit(i, "signed_cmp_bit",
+                     f"node {i}: sign-flipped subtraction bit {k} "
+                     f"(full-subtractor)",
+                     {0: 1}, {lay.diff_bits[k]: 1}, rel)
+                bool_pin(i, "sbit_booleanity", lay.diff_bits[k],
+                         f"diff bit {k}")
+                bool_pin(i, "scarry_booleanity", borrows[k + 1],
+                         f"borrow {k + 1}")
+            if node.kind == _SLT:
+                emit(i, "signed_flag",
+                     f"node {i}: slt flag = top borrow (signed x < y)",
+                     {0: 1}, {lay.flag_slot: 1}, {borrows[w]: 1})
+            else:
+                emit(i, "signed_flag",
+                     f"node {i}: sle flag = 1 - top borrow (signed x <= y)",
+                     {0: 1}, {lay.flag_slot: 1},
+                     merge(({0: 1}, 1), ({borrows[w]: 1}, -1)))
+            bool_pin(i, "sbit_booleanity", lay.flag_slot, "compare flag")
+        elif node.kind == _SEQ:
+            lay = signed_cmp_layouts[i]
+            w = node.width
+            assert w is not None
+            x, y = node.inputs
+            # 逐位同或：2·x_k·y_k = e_k - 1 + x_k + y_k（A=2x_k 为单变量，
+            # 常系数 2 在 p=97 上非零；操作数为 signed_const 时 A 落在常数槽，
+            # 此时两侧都是常数，约束直接不可满足当且仅当该位不相等）。
+            for k in range(w):
+                xk, yk = sbit(x, k), sbit(y, k)
+                emit(i, "seq_prod",
+                     f"node {i}: bit {k} XNOR: 2*x*y = e - 1 + x + y",
+                     merge((xk, 2),), yk,
+                     merge(({lay.eq_prod[k]: 1}, 1), ({0: 1}, -1),
+                           (xk, 1), (yk, 1)))
+                bool_pin(i, "sbit_booleanity", lay.eq_prod[k],
+                         f"xnor bit {k}")
+            # 与链：q_0 = e_0；q_k = q_{k-1}·e_k；标志 f = q_{w-1}。
+            q = lay.eq_chain
+            emit(i, "signed_pin", f"node {i}: equality chain[0] = e_0",
+                 {0: 1}, {q[0]: 1}, {lay.eq_prod[0]: 1})
+            for k in range(1, w):
+                emit(i, "seq_chain",
+                     f"node {i}: equality chain[{k}] = chain[{k-1}] * e_{k}",
+                     {q[k - 1]: 1}, {lay.eq_prod[k]: 1}, {q[k]: 1})
+            for k, qs in enumerate(q):
+                bool_pin(i, "scarry_booleanity", qs,
+                         f"equality chain {k}")
 
     return CompiledCircuit(
         p=P,
@@ -386,6 +795,9 @@ def compile_circuit(circuit: Circuit) -> CompiledCircuit:
         sources=tuple(sources),
         inputs=dict(input_slots),
         nodes=nodes,
+        signed_inputs=signed_input_widths,
+        signed_layouts=signed_layouts,
+        signed_cmp_layouts=signed_cmp_layouts,
     )
 
 
@@ -402,6 +814,39 @@ def _check_user_inputs(raw: object) -> Mapping[str, object]:
     return raw
 
 
+def _parse_signed_input(raw: object, name: str, width: int) -> int:
+    """有符号输入的严格取值：有限 int 且落在 w 位区间内。
+
+    与普通域输入不同，这里**不做模 97 规约、也不回绕**：回绕只是运算溢出
+    策略，非法输入（越界）抛 SignedInputError；类型非法沿用全局契约：
+    bool/普通 float -> TypeError，NaN/Infinity -> ValueError。
+    """
+
+    low, high = signed_range(width)
+    if isinstance(raw, bool):
+        raise TypeError(
+            f"signed input {name!r} must be int, got bool "
+            f"(booleans are not accepted)"
+        )
+    if isinstance(raw, float):
+        if math.isnan(raw):
+            raise ValueError(f"signed input {name!r} must be finite int, got NaN")
+        if math.isinf(raw):
+            raise ValueError(
+                f"signed input {name!r} must be finite int, got Infinity"
+            )
+        raise TypeError(
+            f"signed input {name!r} must be int, got float {raw!r}"
+        )
+    if not isinstance(raw, int):
+        raise TypeError(
+            f"signed input {name!r} must be int, got {type(raw).__name__}"
+        )
+    if not (low <= raw <= high):
+        raise SignedInputError(name, width, raw, kind="range")
+    return raw
+
+
 def generate_witness(compiled: CompiledCircuit,
                       user_inputs: Mapping[str, object]) -> list[int]:
     """根据命名输入生成完整见证向量 z（z[0]=1）。
@@ -409,11 +854,13 @@ def generate_witness(compiled: CompiledCircuit,
     失败语义（均在返回前抛出，绝不返回部分见证）:
       - 多余/未声明输入名，或输入名不是 str: UnexpectedInputError / TypeError
       - 缺失输入: UnknownInputError（确定无解；本库无搜索，故不存在预算耗尽）
-      - 输入值非 int 有限标量（bool / NaN / Infinity 等）: TypeError/ValueError
+      - 普通输入值非 int 有限标量: TypeError/ValueError
+      - 有符号输入越界或类型非法: SignedInputError
       - select 选择位非布尔: NonBooleanSelectError
       - assert_equal 不成立: AssertEqualError
 
-    中间槽全部由本函数按 DAG 重新计算，调用方无法通过 user_inputs 覆盖。
+    中间槽（含有符号节点的逐位/进位槽）全部由本函数按 DAG 重新计算，
+    调用方无法通过 user_inputs 覆盖。
     """
 
     if not isinstance(compiled, CompiledCircuit):
@@ -435,52 +882,178 @@ def generate_witness(compiled: CompiledCircuit,
     n_vars = compiled.n_vars
     z: list[int] = [0] * n_vars
     z[0] = 1
+    # 旧语义：每个节点的主域值（有符号值节点取其二补码字 mod 97，
+    # 比较节点取 0/1 标志），供旧 add/mul/select/assert 引用。
     vals: dict[int, int] = {}
+    # 有符号值节点的真实 Python 有符号整数（在 w 位区间内）。
+    svals: dict[int, int] = {}
 
-    # 由变量来源表预计算 节点->主见证槽（常量节点不在表中）。
-    slot_of_node: dict[int, int] = {
-        info.node: info.slot
-        for info in compiled.sources
-        if info.node is not None and info.kind != "select_aux"
-    }
+    # 节点 -> 主见证槽（每个节点唯一；逐位/进位槽不算主槽）。
+    main_slot_of: dict[int, int] = {}
+    for nd_id, lay in compiled.signed_layouts.items():
+        main_slot_of[nd_id] = lay.word_slot
+    for nd_id, lay in compiled.signed_cmp_layouts.items():
+        main_slot_of[nd_id] = lay.flag_slot
+    for info in compiled.sources:
+        if info.node is not None and info.kind in (
+            "signed_bit", "signed_carry", "signed_diff_bit", "signed_borrow",
+            "signed_eq_prod", "signed_eq_chain",
+        ):
+            continue
+        if info.node is not None and info.node not in main_slot_of:
+            main_slot_of[info.node] = info.slot
 
-    # 先做输入取值与缺失检查（parse_scalar 负责 NaN/Infinity/bool 语义），
-    # 保证进入逐节点计算前所有外部值已确定，失败即整体失败。
-    input_values: dict[int, int] = {}
-    for name, slot in compiled.inputs.items():
+    # 先做输入取值与缺失检查，保证进入逐节点计算前所有外部值已确定。
+    field_input_values: dict[str, int] = {}
+    signed_input_values: dict[str, int] = {}
+    for name in compiled.inputs:
         if name not in mapping:
             raise UnknownInputError(name)
-        input_values[slot] = parse_scalar(mapping[name], what=f"input {name!r}")
+        if name in compiled.signed_inputs:
+            signed_input_values[name] = _parse_signed_input(
+                mapping[name], name, compiled.signed_inputs[name]
+            )
+        else:
+            field_input_values[name] = parse_scalar(
+                mapping[name], what=f"input {name!r}"
+            )
+
+    def fill_word_of_signed(nd_id: int, svalue: int) -> None:
+        """把有符号值节点的比特槽与字槽写入见证。"""
+
+        w = compiled.nodes[nd_id].width
+        assert w is not None
+        lay = compiled.signed_layouts[nd_id]
+        bits = signed_to_bits(svalue, w)
+        for k, bs in enumerate(lay.bit_slots):
+            z[bs] = bits[k]
+        unsigned = sum(b << k for k, b in enumerate(bits))
+        z[lay.word_slot] = unsigned % P
+        svals[nd_id] = svalue
+        vals[nd_id] = unsigned % P
 
     for i, node in enumerate(compiled.nodes):
         if node.kind == _CONST:
-            vals[i] = node.value  # type: ignore[assignment]
+            vals[i] = node.value % P  # type: ignore[operator]
+            continue
+        if node.kind == _SIGNED_CONST:
+            w = node.width
+            assert w is not None
+            unsigned = node.value % (1 << w)  # type: ignore[operator]
+            vals[i] = unsigned % P
+            svals[i] = node.value  # type: ignore[assignment]
             continue
 
-        slot = slot_of_node[i]
+        slot = main_slot_of[i]
 
         if node.kind == _INPUT:
-            v = input_values[slot]
+            v = field_input_values[node.name]  # type: ignore[index]
+            z[slot] = v
+            vals[i] = v
+        elif node.kind == _SIGNED_INPUT:
+            fill_word_of_signed(
+                i, signed_input_values[node.name]  # type: ignore[index]
+            )
         elif node.kind == _ADD:
             x, y = node.inputs
             v = (vals[x] + vals[y]) % P
+            z[slot] = v
+            vals[i] = v
         elif node.kind == _MUL:
             x, y = node.inputs
             v = (vals[x] * vals[y]) % P
+            z[slot] = v
+            vals[i] = v
         elif node.kind == _SELECT:
             b, x, y = node.inputs
             bv, xv, yv = vals[b], vals[x], vals[y]
             if bv not in (0, 1):
                 raise NonBooleanSelectError(i, bv)
             v = (bv * xv + (1 - bv) * yv) % P
-        else:  # assert_equal
+            z[slot] = v
+            vals[i] = v
+        elif node.kind == _ASSERT:
             x, y = node.inputs
             if vals[x] != vals[y]:
                 raise AssertEqualError(i, vals[x], vals[y])
             v = vals[x]
-
-        z[slot] = v
-        vals[i] = v
+            z[slot] = v
+            vals[i] = v
+        elif node.kind in (_SADD, _SSUB):
+            w = node.width
+            assert w is not None
+            x, y = node.inputs
+            ax, ay = svals[x], svals[y]
+            if node.kind == _SADD:
+                r = (ax + ay + (1 << (w - 1))) % (1 << w) - (1 << (w - 1))
+            else:
+                r = (ax - ay + (1 << (w - 1))) % (1 << w) - (1 << (w - 1))
+            fill_word_of_signed(i, r)
+            # 填充进位/借位辅助槽。
+            lay = compiled.signed_layouts[i]
+            bx = signed_to_bits(ax, w)
+            by = signed_to_bits(ay, w)
+            br = signed_to_bits(r, w)
+            carries = lay.carry_slots
+            z[carries[0]] = 0
+            if node.kind == _SADD:
+                c = 0
+                for k in range(w):
+                    total = bx[k] + by[k] + c
+                    assert br[k] == total % 2
+                    c = total // 2
+                    z[carries[k + 1]] = c
+            else:
+                rr = 0
+                for k in range(w):
+                    diff = bx[k] - by[k] - rr
+                    assert br[k] == diff % 2
+                    rr = 1 if diff < 0 else 0
+                    z[carries[k + 1]] = rr
+        elif node.kind in (_SLT, _SLE):
+            w = node.width
+            assert w is not None
+            x, y = node.inputs
+            ax, ay = svals[x], svals[y]
+            bias = 1 << (w - 1)
+            ux = (ax + bias) % (1 << w)  # 符号位翻转后的无符号值
+            uy = (ay + bias) % (1 << w)
+            lay = compiled.signed_cmp_layouts[i]
+            if node.kind == _SLT:
+                flag = 1 if ax < ay else 0
+                left_u, right_u = ux, uy
+            else:
+                flag = 1 if ax <= ay else 0
+                left_u, right_u = uy, ux
+            z[lay.flag_slot] = flag
+            # 差值比特与借位：对翻转后的无符号值做 w 位减法。
+            bl = tuple((left_u >> k) & 1 for k in range(w))
+            brt = tuple((right_u >> k) & 1 for k in range(w))
+            z[lay.borrows[0]] = 0
+            rr = 0
+            for k in range(w):
+                d = bl[k] - brt[k] - rr
+                z[lay.diff_bits[k]] = d % 2
+                rr = 1 if d < 0 else 0
+                z[lay.borrows[k + 1]] = rr
+            vals[i] = flag
+        elif node.kind == _SEQ:
+            w = node.width
+            assert w is not None
+            x, y = node.inputs
+            ax, ay = svals[x], svals[y]
+            lay = compiled.signed_cmp_layouts[i]
+            bx = signed_to_bits(ax, w)
+            by = signed_to_bits(ay, w)
+            qv = 1
+            for k in range(w):
+                e = 1 if bx[k] == by[k] else 0
+                z[lay.eq_prod[k]] = e
+                qv &= e
+                z[lay.eq_chain[k]] = qv
+            assert qv == (1 if ax == ay else 0)
+            z[lay.flag_slot] = qv
+            vals[i] = qv
 
     return z
 

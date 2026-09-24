@@ -93,5 +93,36 @@ class UnexpectedInputError(WitnessError):
         self.reason = reason
 
 
+class SignedInputError(WitnessError):
+    """有符号整数输入不在其位宽允许的范围内（含类型非法：bool/float 等）。
+
+    属性:
+        name: 输入名。
+        width: 有符号位宽（2..8）。
+        low, high: 该位宽的合法闭区间 [-2**(w-1), 2**(w-1)-1]。
+        value: 触发问题的值（int 越界时为实际 int；类型错误时可能为任意对象）。
+        kind: "range" | "type"，区分越界与类型非法。
+    """
+
+    def __init__(self, name: str, width: int, value: object, *,
+                 kind: str = "range"):
+        low = -(1 << (width - 1))
+        high = (1 << (width - 1)) - 1
+        if kind == "range":
+            msg = (f"signed input {name!r} (width {width}) must be an int in "
+                   f"[{low}, {high}] (two's complement, wrap-around only), "
+                   f"got {value!r}")
+        else:
+            msg = (f"signed input {name!r} (width {width}) must be a finite "
+                   f"int in [{low}, {high}], got {type(value).__name__}")
+        super().__init__(msg)
+        self.name = name
+        self.width = width
+        self.low = low
+        self.high = high
+        self.value = value
+        self.kind = kind
+
+
 class AuditError(ZkCircError):
     """对见证做审计时，见证向量形状不合法（长度不符/含越界值）。"""

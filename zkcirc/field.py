@@ -61,3 +61,68 @@ def finv(a: int) -> int:
     if a == 0:
         raise ZeroDivisionError("no modular inverse of 0")
     return pow(a, P - 2, P)
+
+
+# ---------------------------------------------------------------------------
+# 2..8 位有符号整数（二补码）工具
+# ---------------------------------------------------------------------------
+#
+# 本库支持的有符号整数位宽闭区间。p=97 足以无损容纳 w 位运算所需的全部
+# 整数：无符号值最大 2**8-1=255 会超过 96，但所有约束只使用「单比特
+# 0/1 与进位比特」，见证里从不存放整个无符号字；二补码数值本身落在
+# [-128,127]，进入域时按模 97 规约（仅用于展示/与旧域电路互通）。
+
+MIN_SIGNED_WIDTH = 2
+MAX_SIGNED_WIDTH = 8
+
+
+def check_width(width: object) -> int:
+    """校验有符号位宽：必须是 int（拒绝 bool）且在 2..8。"""
+
+    if isinstance(width, bool) or not isinstance(width, int):
+        raise TypeError(
+            f"signed width must be int, got {type(width).__name__}"
+        )
+    if not (MIN_SIGNED_WIDTH <= width <= MAX_SIGNED_WIDTH):
+        raise ValueError(
+            f"signed width must be in [{MIN_SIGNED_WIDTH}, "
+            f"{MAX_SIGNED_WIDTH}], got {width}"
+        )
+    return width
+
+
+def signed_range(width: int) -> tuple[int, int]:
+    """返回 w 位有符号整数的合法闭区间 (-2**(w-1), 2**(w-1)-1)。"""
+
+    w = check_width(width)
+    return (-(1 << (w - 1)), (1 << (w - 1)) - 1)
+
+
+def wrap_signed(value: int, width: int) -> int:
+    """把任意 Python int 按 w 位二补码回绕到合法区间（溢出策略：仅回绕）。"""
+
+    w = check_width(width)
+    mask = 1 << w
+    return ((value + (1 << (w - 1))) % mask) - (1 << (w - 1))
+
+
+def signed_to_bits(value: int, width: int) -> tuple[int, ...]:
+    """合法 w 位有符号整数 -> 小端比特元组（b[0] 为 LSB，元素为 0/1 int）。"""
+
+    w = check_width(width)
+    low, high = signed_range(w)
+    if not (low <= value <= high):
+        raise ValueError(
+            f"signed value {value} out of range [{low}, {high}] for width {w}"
+        )
+    return tuple((value >> i) & 1 for i in range(w))
+
+
+def bits_to_signed(bits: tuple[int, ...], width: int) -> int:
+    """小端比特元组 -> w 位有符号整数（最高位按符号位解释）。"""
+
+    w = check_width(width)
+    if len(bits) != w or any(b not in (0, 1) for b in bits):
+        raise ValueError(f"expected {w} bits of 0/1, got {bits!r}")
+    unsigned = sum(b << i for i, b in enumerate(bits))
+    return unsigned - (bits[w - 1] << w)
