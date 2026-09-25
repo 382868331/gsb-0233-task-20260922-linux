@@ -23,6 +23,8 @@ def reference_eval(spec: Sequence[Mapping[str, object]],
 
     - select 的 b 必须为 0/1，否则 ValueError（独立复现契约）。
     - assert_equal 两侧不等则 ValueError，否则输出取左侧。
+    - lookup 独立用成员多项式 product(v-t) 校验：乘积非 0 即不属于表，
+      ValueError；输出等于输入值。这里同样不借助任何布尔判断。
     """
 
     values: list[int] = []
@@ -53,6 +55,17 @@ def reference_eval(spec: Sequence[Mapping[str, object]],
                     f"assert_equal at node {i}: {values[x]} != {values[y]}"
                 )
             values.append(values[x])
+        elif kind == "lookup":
+            v = values[kids[0]]
+            table = tuple(node["table"])
+            product = 1
+            for t in table:
+                product = (product * (v - t)) % P
+            if product != 0:
+                raise ValueError(
+                    f"lookup at node {i}: value {v} not in table {list(table)}"
+                )
+            values.append(v)
         else:
             raise ValueError(f"unknown kind {kind!r} at node {i}")
     return values

@@ -30,6 +30,8 @@ from .errors import (
     UnexpectedInputError,
     NonBooleanSelectError,
     AssertEqualError,
+    LookupTableError,
+    LookupMembershipError,
 )
 
 MAX_NODES = 200
@@ -40,8 +42,11 @@ _ADD = "add"
 _MUL = "mul"
 _SELECT = "select"
 _ASSERT = "assert_equal"
+_LOOKUP = "lookup"
 
-_VALID_KINDS = frozenset({_CONST, _INPUT, _ADD, _MUL, _SELECT, _ASSERT})
+_VALID_KINDS = frozenset(
+    {_CONST, _INPUT, _ADD, _MUL, _SELECT, _ASSERT, _LOOKUP}
+)
 # 每种节点的子节点引用个数。
 _ARITY = {
     _CONST: 0,
@@ -50,7 +55,11 @@ _ARITY = {
     _MUL: 2,
     _SELECT: 3,
     _ASSERT: 2,
+    _LOOKUP: 1,
 }
+
+#: lookup 表的长度上下限（题目契约：1..8 个互不相同的域元素）。
+MAX_LOOKUP_TABLE = 8
 
 
 # ---------------------------------------------------------------------------
@@ -68,12 +77,15 @@ class Node:
         - "add"/"mul":    二元算术，inputs=(x, y) 为被引用节点的下标
         - "select":       inputs=(b, x, y)，b 非 0/1 时见证生成失败
         - "assert_equal": inputs=(x, y)，x!=y 时见证生成失败；输出值取 x
+        - "lookup":       inputs=(value,)，table 为 1..8 个互不相同的规范
+                          域元素；输出等于 value 且约束 value 属于该表
     """
 
     kind: str
     value: int | None = None
     inputs: tuple[int, ...] = ()
     name: str | None = None
+    table: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -153,6 +165,8 @@ class Circuit:
     def __init__(self) -> None:
         self._nodes: list[Node] = []
         self._input_names: set[str] = set()
+        # 相同的表复用同一个规范化元组对象（常量结构共享）。
+        self._tables: dict[tuple[int, ...], tuple[int, ...]] = {}
 
     # -- 基础属性 -----------------------------------------------------------
 
@@ -214,6 +228,31 @@ class Circuit:
         self._check_ref(y, "assert_equal y")
         return self._append(Node(_ASSERT, inputs=(x, y)))
 
+    def lookup(self, value: int, table: object) -> int:
+        """追加 lookup(value, table) 节点。
+
+        ``table`` 必须是 1..8 个**互不相同**的**规范域元素**
+        （``int`` 且 ``0 <= v < 97``；拒绝 bool）。空表、重复元素、
+        非规范值（如 97 / -1）或非法类型在构建期直接拒绝。
+
+        节点输出值等于 ``value``；编译时额外用成员多项式
+        ``prod_j (value - t_j) = 0`` 拆成的原始 R1CS 乘法门约束
+        ``value`` 属于表——不引入任何没有约束的宿主布尔判断。
+        表元素的顺序被保留（影响连乘中间槽的计算顺序），相同的表
+        结构在电路内复用同一个规范化对象。
+        """
+
+        self._check_ref(value, "lookup value")
+        norm = self._intern_table(_validate_lookup_table(table))
+        return self._append(Node(_LOOKUP, inputs=(value,), table=norm))
+
+    def _intern_table(self, norm: tuple[int, ...]) -> tuple[int, ...]:
+        existing = self._tables.get(norm)
+        if existing is None:
+            self._tables[norm] = norm
+            return norm
+        return existing
+
     # -- 内部 ---------------------------------------------------------------
 
     def _check_ref(self, ref: object, what: str) -> None:
@@ -234,6 +273,63 @@ class Circuit:
             )
         self._nodes.append(node)
         return len(self._nodes) - 1
+
+
+def _validate_lookup_table(table: object) -> tuple[int, ...]:
+    """校验 lookup 表并返回规范化元组（顺序保留）。
+
+    规则（构建期确定性拒绝，不静默纠正）:
+      - 必须是 list/tuple（不接受集合等无序对象，以保留可复现的
+        连乘顺序）；长度 1..MAX_LOOKUP_TABLE。
+      - 每个元素必须是规范域元素：int、非 bool、0 <= v < P。
+        负数与 >= P 的值在这里直接拒绝（不做模规约），因为题目要求
+        「非规范域值先拒绝」。
+      - 元素不得重复。
+    """
+
+    if not isinstance(table, (list, tuple)):
+        raise TypeError(
+            "lookup table must be a list or tuple of canonical field "
+            f"elements, got {type(table).__name__}"
+        )
+    if len(table) == 0:
+        raise LookupTableError("lookup table must contain 1..8 elements, got 0")
+    if len(table) > MAX_LOOKUP_TABLE:
+        raise LookupTableError(
+            f"lookup table too large: {len(table)} elements, at most "
+            f"{MAX_LOOKUP_TABLE}"
+        )
+    seen: set[int] = set()
+    normalized: list[int] = []
+    for idx, item in enumerate(table):
+        if isinstance(item, bool):
+            raise TypeError(
+                f"lookup table[{idx}] must be int, got bool (booleans are "
+                "not accepted)"
+            )
+        if not isinstance(item, int):
+            if isinstance(item, float):
+                if math.isnan(item):
+                    raise ValueError(f"lookup table[{idx}] must be int, got NaN")
+                if math.isinf(item):
+                    raise ValueError(
+                        f"lookup table[{idx}] must be int, got Infinity"
+                    )
+            raise TypeError(
+                f"lookup table[{idx}] must be int, got {type(item).__name__}"
+            )
+        if not (0 <= item < P):
+            raise ValueError(
+                f"lookup table[{idx}]={item} is not a canonical field "
+                f"element [0, {P - 1}]; values are not reduced here"
+            )
+        if item in seen:
+            raise LookupTableError(
+                f"lookup table contains duplicate element {item} at index {idx}"
+            )
+        seen.add(item)
+        normalized.append(item)
+    return tuple(normalized)
 
 
 # ---------------------------------------------------------------------------
@@ -280,9 +376,27 @@ def compile_circuit(circuit: Circuit) -> CompiledCircuit:
                     f"node {i} references {ref}; references must point to an "
                     f"earlier node in [0, {i})"
                 )
+        if node.kind == _LOOKUP:
+            if not isinstance(node.table, tuple) or not (
+                1 <= len(node.table) <= MAX_LOOKUP_TABLE
+            ):
+                raise CompileError(
+                    f"lookup node {i} has an invalid table structure"
+                )
+            if any(not isinstance(t, int) or isinstance(t, bool)
+                   or not (0 <= t < P) for t in node.table):
+                raise CompileError(
+                    f"lookup node {i} table holds non-canonical elements"
+                )
+            if len(set(node.table)) != len(node.table):
+                raise CompileError(f"lookup node {i} table has duplicates")
 
     # -- 槽位分配（节点下标顺序即拓扑序）------------------------------------
+    # lookup 节点除输出槽外，还要为成员多项式连乘分配 k 个中间槽 m_0..m_{k-1}：
+    # 每个 lookup 独享自己的中间槽（即使多个 lookup 共用同一张表，
+    # 不同 value 的中间值也绝不共享）。
     slot_of: dict[int, int] = {}
+    lookup_aux_slots: dict[int, tuple[int, ...]] = {}
     sources: list[VariableInfo] = [
         VariableInfo(0, "constant_one", None, None, None)
     ]
@@ -291,6 +405,17 @@ def compile_circuit(circuit: Circuit) -> CompiledCircuit:
     for i, node in enumerate(nodes):
         if node.kind == _CONST:
             continue
+        if node.kind == _LOOKUP:
+            assert node.table is not None
+            aux: list[int] = []
+            for _t in node.table:
+                sources.append(
+                    VariableInfo(next_slot, "intermediate", i, None,
+                                 "lookup_aux")
+                )
+                aux.append(next_slot)
+                next_slot += 1
+            lookup_aux_slots[i] = tuple(aux)
         slot_of[i] = next_slot
         role = "input" if node.kind == _INPUT else "intermediate"
         sources.append(VariableInfo(next_slot, role, i, node.name, node.kind))
@@ -378,6 +503,42 @@ def compile_circuit(circuit: Circuit) -> CompiledCircuit:
             emit(i, "assert_equal",
                  f"assert_equal node {i}: x - y = 0",
                  merge((lin(x), 1), (lin(y), -1)), {0: 1}, {})
+        elif node.kind == _LOOKUP:
+            (value_ref,) = node.inputs
+            table = node.table
+            assert table is not None
+            k = len(table)
+            v = slot_of[i]
+            aux_slots = lookup_aux_slots[i]
+            lv = lin(value_ref)
+
+            # 成员多项式 P(x) = prod_j (x - t_j)。在域 p=97 上：
+            #   value 属于表  <=>  P(value) = 0
+            # （表元素互异；即使表含 0 也成立。）不引入宿主布尔判断，
+            # 全部拆成原始 R1CS 乘法门，每个连乘中间值独占见证槽。
+            #
+            # m_0 = value - t_0
+            t0 = table[0]
+            emit(i, "lookup_head",
+                 f"lookup node {i}: m0 = value - {t0}",
+                 {0: 1}, {aux_slots[0]: 1},
+                 merge((lv, 1), ({0: t0}, -1)))
+            # m_j = m_{j-1} * (value - t_j), j = 1..k-1
+            for j in range(1, k):
+                emit(i, "lookup_chain",
+                     f"lookup node {i}: m{j} = m{j-1} * (value - {table[j]})",
+                     {aux_slots[j - 1]: 1},
+                     merge((lv, 1), ({0: table[j]}, -1)),
+                     {aux_slots[j]: 1})
+            # 输出 v = value，同时末尾因子积 m_{k-1} 必须为 0：
+            #   1 * v = lin(value)
+            emit(i, "lookup_value",
+                 f"lookup node {i}: output v = value",
+                 {0: 1}, {v: 1}, lv)
+            #   m_{k-1} * 1 = 0
+            emit(i, "lookup_membership",
+                 f"lookup node {i}: membership product m{k-1} = 0",
+                 {aux_slots[-1]: 1}, {0: 1}, {})
 
     return CompiledCircuit(
         p=P,
@@ -412,6 +573,7 @@ def generate_witness(compiled: CompiledCircuit,
       - 输入值非 int 有限标量（bool / NaN / Infinity 等）: TypeError/ValueError
       - select 选择位非布尔: NonBooleanSelectError
       - assert_equal 不成立: AssertEqualError
+      - lookup 的 value 不属于表: LookupMembershipError
 
     中间槽全部由本函数按 DAG 重新计算，调用方无法通过 user_inputs 覆盖。
     """
@@ -444,6 +606,15 @@ def generate_witness(compiled: CompiledCircuit,
         if info.node is not None and info.kind != "select_aux"
     }
 
+    # lookup 节点 -> 连乘中间槽（按 m_0..m_{k-1} 排序）。每次 lookup
+    # 各自独立；同一张表被两个 lookup 共享时中间槽也互不相同。
+    lookup_aux_of_node: dict[int, list[int]] = {}
+    for info in compiled.sources:
+        if info.kind == "lookup_aux":
+            lookup_aux_of_node.setdefault(info.node, []).append(info.slot)
+    for node_id in lookup_aux_of_node:
+        lookup_aux_of_node[node_id].sort()
+
     # 先做输入取值与缺失检查（parse_scalar 负责 NaN/Infinity/bool 语义），
     # 保证进入逐节点计算前所有外部值已确定，失败即整体失败。
     input_values: dict[int, int] = {}
@@ -473,6 +644,19 @@ def generate_witness(compiled: CompiledCircuit,
             if bv not in (0, 1):
                 raise NonBooleanSelectError(i, bv)
             v = (bv * xv + (1 - bv) * yv) % P
+        elif node.kind == _LOOKUP:
+            (value_ref,) = node.inputs
+            assert node.table is not None
+            vv = vals[value_ref]
+            product = 1
+            for j, tj in enumerate(node.table):
+                product = (product * (vv - tj)) % P
+                z[lookup_aux_of_node[i][j]] = product
+            # 连乘末槽非 0 => value 不属于表；对任何伪造的中间值，
+            # 审计侧的 R1CS 门同样会失败（见 lookup_* 约束）。
+            if product != 0:
+                raise LookupMembershipError(i, vv, node.table)
+            v = vv
         else:  # assert_equal
             x, y = node.inputs
             if vals[x] != vals[y]:

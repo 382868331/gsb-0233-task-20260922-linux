@@ -20,6 +20,8 @@ from zkcirc import (
     audit,
     NonBooleanSelectError,
     UnknownInputError,
+    LookupTableError,
+    LookupMembershipError,
 )
 
 LINE = "=" * 72
@@ -162,13 +164,89 @@ def part_c() -> None:
           f"其中 {s_node} 即被篡改的 s=x+y 定义节点。")
 
 
+def part_d() -> None:
+    print()
+    print(LINE)
+    print("D. lookup(value, table)：成员多项式连乘门 + 表校验 + 伪造见证")
+    print(LINE)
+    c = Circuit()
+    x = c.input("x")
+    table = [0, 3, 10, 96]          # 含 0 的表
+    node = c.lookup(x, table)
+    cc = compile_circuit(c)
+    print(f"表 = {table}（{len(table)} 个互不相同的规范域元素）")
+    print(f"lookup 约束标签：{[con.tag for con in cc.constraints]}")
+    print("成员多项式 P(value)=prod(value-t_j) 拆成原始乘法门；"
+          "没有未约束的宿主布尔判断。")
+    print()
+
+    # D1：成员值（含边界 0 与 96）逐值生成见证并审计。
+    for v in table:
+        z = generate_witness(cc, {"x": v})
+        report = audit(cc, z)
+        out_slot = next(
+            s.slot for s in cc.sources
+            if s.node == node and s.kind != "lookup_aux"
+        )
+        print(f"  value={v:>2}: 见证接受，输出槽={z[out_slot]}（仍等于输入），"
+              f"audit ok={report.ok}")
+        assert report.ok and z[out_slot] == v
+    print()
+
+    # D2：非成员值在见证生成期被明确拒绝。
+    try:
+        generate_witness(cc, {"x": 7})
+    except LookupMembershipError as exc:
+        print(f"[拒绝] value=7 不属于表 -> {type(exc).__name__}")
+        print(f"       {exc}")
+
+    # D3：构建期拒绝非法表（空表 / 重复 / 非规范值）。
+    for bad in ([], [3, 3], [97]):
+        try:
+            cb = Circuit()
+            cb.lookup(cb.input("y"), bad)
+        except (LookupTableError, ValueError) as exc:
+            print(f"[拒绝] 非法表 {bad} -> {type(exc).__name__}: {exc}")
+    print()
+
+    # D4：两个 lookup 共享同一张表但中间见证独立；伪造连乘中间槽必失败。
+    c2 = Circuit()
+    a = c2.input("a")
+    b = c2.input("b")
+    na = c2.lookup(a, table)
+    nb = c2.lookup(b, table)
+    assert c2.get_node(na).table is c2.get_node(nb).table
+    cc2 = compile_circuit(c2)
+    z = generate_witness(cc2, {"a": 3, "b": 10})
+    print(f"两个 lookup 共享同一表常量：a=3, b=10，audit ok="
+          f"{audit(cc2, z).ok}；连乘中间槽互不相同。")
+
+    # 伪造：value 改成非成员 7，同时尝试把末槽伪造成 0。
+    aux_slots = [s.slot for s in cc.sources
+                 if s.node == node and s.kind == "lookup_aux"]
+    out_slot = next(s.slot for s in cc.sources
+                    if s.node == node and s.kind != "lookup_aux")
+    forged = generate_witness(cc, {"x": 3})
+    forged[cc.inputs["x"]] = 7
+    forged[out_slot] = 7
+    forged[aux_slots[-1]] = 0  # 单独伪造末槽为 0 无法通过链式乘法门
+    report = audit(cc, forged)
+    print(f"伪造见证（value=7 非成员，强行置末槽=0）：ok={report.ok}，"
+          f"失败 {len(report.failures)} 条：")
+    for f in report.failures:
+        print(f"  [FAIL] #{f.index} tag={f.tag}：{f.origin} "
+              f"(lhs={f.lhs}, rhs={f.rhs})")
+    assert not report.ok
+
+
 def main() -> None:
     part_a()
     part_b()
     part_c()
+    part_d()
     print()
     print(LINE)
-    print("演示结束：1 个正常结果 + 2 个实际触发的异常拒绝 + 1 组失败约束定位。")
+    print("演示结束：正常路径 + 异常拒绝 + 失败约束定位 + lookup 查找表演示。")
     print("本程序不生成任何真实链上证明，仅在 p=97 域内做约束审计。")
     print(LINE)
 

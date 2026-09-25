@@ -73,6 +73,33 @@ class AssertEqualError(WitnessError):
         self.right = right
 
 
+class LookupTableError(CircuitBuildError):
+    """lookup 表声明非法（空表、元素重复、非规范域值、长度超出 8）。
+
+    表在构建 DAG 时就固定下来，非法表属于确定性的构建期拒绝，
+    绝不留到见证生成阶段。
+    """
+
+
+class LookupMembershipError(WitnessError):
+    """lookup 的输入值不属于所声明的查找表。
+
+    属性:
+        node: 触发问题的 lookup 节点索引。
+        value: 实际输入域值（0..p-1 的 int）。
+        table: 该 lookup 声明的表（已规范化、排序去重前的原顺序元组）。
+    """
+
+    def __init__(self, node: int, value: int, table: tuple[int, ...]):
+        super().__init__(
+            f"lookup node {node} failed: value {value} is not a member of "
+            f"table {list(table)} (field p=97); membership product is nonzero"
+        )
+        self.node = node
+        self.value = value
+        self.table = table
+
+
 class UnknownInputError(WitnessError):
     """命名输入缺失（无解），区分于「预算耗尽」。
 
