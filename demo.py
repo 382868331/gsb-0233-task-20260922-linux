@@ -6,7 +6,8 @@
   A. 正常路径：构建含共享子表达式与 select 的电路，编译为稀疏 R1CS，
      生成见证，逐约束审计通过，并打印变量来源。
   B. 异常边界：非布尔 select 选择位被拒绝；缺失命名输入被拒绝。
-  C. 失败约束定位：篡改一个中间见证槽，audit 逐约束报告失败位置。
+ C. 失败约束定位：篡改一个中间见证槽，audit 逐约束报告失败位置。
+  D. lookup(value, table) 成员约束：接受/拒绝现场计算 + 伪造中间值被抓。
 
 所有输入均写死在本文件中，结果全部现场计算，不使用 sleep 或预录输出。
 """
@@ -20,6 +21,7 @@ from zkcirc import (
     audit,
     NonBooleanSelectError,
     UnknownInputError,
+    LookupMissError,
 )
 
 LINE = "=" * 72
@@ -162,13 +164,61 @@ def part_c() -> None:
           f"其中 {s_node} 即被篡改的 s=x+y 定义节点。")
 
 
+def part_d() -> None:
+    print()
+    print(LINE)
+    print("D. lookup(value, table)：有限查找表成员约束（含 0 表）")
+    print(LINE)
+    table = [0, 5, 10, 42]  # 含 0；4 个互不重复的规范域元素
+    c = Circuit()
+    x = c.input("x")
+    lk = c.lookup(x, table)
+    cc = compile_circuit(c)
+    print(f"查找表 = {table}；成员多项式连乘拆成的约束：")
+    for con in cc.constraints:
+        print(f"  #{con.index} tag={con.tag:<14} {con.origin}")
+        print(f"       A={con.a}\n       B={con.b}\n       C={con.c}")
+    aux = [info.slot for info in cc.sources
+           if info.node == lk and info.kind == "lookup_aux"]
+    print(f"lookup 独占的连乘中间槽 = {aux}（输出槽另计，不与任何"
+          "其他 lookup 共享）")
+    print()
+
+    for v in (0, 10, 42):
+        z = generate_witness(cc, {"x": v})
+        print(f"[接受] x={v}：输出槽={z[next(i.slot for i in cc.sources if i.node == lk and i.kind != 'lookup_aux')]}, "
+              f"连乘槽={[z[s] for s in aux]}，audit ok={audit(cc, z).ok}")
+
+    try:
+        generate_witness(cc, {"x": 6})  # 6 不在 [0, 5, 10, 42]
+    except LookupMissError as exc:
+        print(f"[拒绝] x=6 -> {type(exc).__name__}：{exc}")
+
+    # 伪造：x 取表外值 6，却把输出槽改成成员 5、所有连乘槽填 0
+    # （末门 p_n*1=0 因此被满足），输出定义 1*v_out=v_in 仍必失败。
+    z_bad = generate_witness(cc, {"x": 5})
+    out_slot = next(i.slot for i in cc.sources
+                    if i.node == lk and i.kind != "lookup_aux")
+    z_bad[cc.inputs["x"]] = 6
+    z_bad[out_slot] = 5
+    for s in aux:
+        z_bad[s] = 0
+    report = audit(cc, z_bad)
+    print(f"[伪造中间值] x 槽=6、输出槽=5、连乘槽全 0 -> audit ok={report.ok}")
+    for f in report.failures:
+        print(f"         FAIL #{f.index} tag={f.tag} 节点={f.node} "
+              f"lhs={f.lhs} rhs={f.rhs} 差={f.difference}")
+    assert not report.ok
+
+
 def main() -> None:
     part_a()
     part_b()
     part_c()
+    part_d()
     print()
     print(LINE)
-    print("演示结束：1 个正常结果 + 2 个实际触发的异常拒绝 + 1 组失败约束定位。")
+    print("演示结束：正常路径 + 异常拒绝 + 失败定位 + lookup 成员约束演示。")
     print("本程序不生成任何真实链上证明，仅在 p=97 域内做约束审计。")
     print(LINE)
 

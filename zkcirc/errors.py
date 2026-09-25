@@ -73,6 +73,25 @@ class AssertEqualError(WitnessError):
         self.right = right
 
 
+class LookupMissError(WitnessError):
+    """lookup 的输入值不属于声明的查找表（确定无解）。
+
+    属性:
+        node: lookup 节点索引。
+        value: 实际域值（0..p-1 的 int）。
+        table: 构建电路时声明的规范表元组（1..8 个互不重复域元素）。
+    """
+
+    def __init__(self, node: int, value: int, table: tuple[int, ...]):
+        super().__init__(
+            f"lookup node {node} value {value} is not in table {list(table)} "
+            f"(field p=97): the membership product cannot be zero"
+        )
+        self.node = node
+        self.value = value
+        self.table = table
+
+
 class UnknownInputError(WitnessError):
     """命名输入缺失（无解），区分于「预算耗尽」。
 

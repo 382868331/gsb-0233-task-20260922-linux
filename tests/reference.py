@@ -46,6 +46,15 @@ def reference_eval(spec: Sequence[Mapping[str, object]],
             if bv not in (0, 1):
                 raise ValueError(f"non-boolean selector at node {i}: {bv}")
             values.append(_norm(bv * values[x] + (1 - bv) * values[y]))
+        elif kind == "lookup":
+            (vr,) = kids
+            table = tuple(node["table"])
+            vv = values[vr]
+            if vv not in table:
+                raise ValueError(
+                    f"lookup at node {i}: value {vv} not in table {list(table)}"
+                )
+            values.append(vv)
         elif kind == "assert_equal":
             x, y = kids
             if values[x] != values[y]:

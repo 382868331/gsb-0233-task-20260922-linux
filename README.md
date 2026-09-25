@@ -1,10 +1,13 @@
 # zkcirc — p=97 算术约束电路的见证生成与审计
 
 一个离线、零第三方依赖的教学型可复用库：在素数域 **p = 97** 上把表达式
-DAG（`add` / `mul` / `const` / `input` / `select` / `assert_equal`）
+DAG（`add` / `mul` / `const` / `input` / `select` / `lookup` /
+`assert_equal`）
 编译为稀疏 **R1CS**（`<A,z>·<B,z> = <C,z> (mod 97)`，`z[0] ≡ 1`），
 生成见证，并对任意见证向量做**逐约束审计**、报告每条失败约束的位置与
-左右侧值。
+左右侧值。`lookup(value, table)` 把「value 属于 1..8 个互不重复域元素
+的有限查找表」表达为成员多项式连乘拆成的原生 R1CS 乘法门，不引入任何
+没有约束的宿主布尔判断。
 
 **本库不生成、也不验证任何真实链上零知识证明**；它只实现题目契约规定
 的有限数学子集，不宣称兼容 Groth16/PLONK 等任何行业协议。
@@ -25,6 +28,36 @@ python -m unittest discover -s tests -v
 python demo.py
 ```
 
+### lookup 可复现使用路径与失败示例
+
+```bash
+./.venv/bin/python - <<'PY'
+from zkcirc import Circuit, compile_circuit, generate_witness, audit, LookupMissError
+
+c = Circuit()
+x = c.input("x")
+c.lookup(x, [0, 5, 10, 42])   # 含 0 的表；输出值 == x，另加成员连乘门
+cc = compile_circuit(c)
+
+z = generate_witness(cc, {"x": 5})          # 5 在表内
+print(audit(cc, z).ok, z[cc.inputs["x"]])   # True 5
+
+generate_witness(cc, {"x": 6})              # 6 不在表内 -> LookupMissError
+PY
+```
+
+现场输出（最后一行是实际抛出的拒绝，不是捕获后吞掉）：
+
+```
+True 5
+zkcirc.errors.LookupMissError: lookup node 1 value 6 is not in table [0, 5, 10, 42] (field p=97): the membership product cannot be zero
+```
+
+`python demo.py` 的 D 节还演示了把表外输入伪造成「输出槽=成员值、
+连乘槽全 0」时，audit 如何在 `lookup_value` 与第一条成员门上同时定位
+失败。完整穷举（全部 97 个域值 × 8 张表、逐中间槽篡改）由
+`tests/test_lookup.py` 自动执行。
+
 ## 目录结构
 
 ```
@@ -40,6 +73,8 @@ tests/
   test_circuit.py    编译/见证/审计：独立解释器对照、非布尔 select、
                      共享子图、中间值篡改、未知输入、稀疏格式
   test_soundness.py  确定性穷举：全部 97 个域值的单点篡改检测
+  test_lookup.py     lookup：逐值接受集合、含 0 表、共享表、
+                     逐槽伪造负例、表校验
 demo.py            固定输入演示
 ```
 
@@ -58,6 +93,7 @@ s   = c.add(x, y)             # 加法
 m   = c.mul(s, k)             # 乘法；节点 s 被共享时只分配一个见证槽
 sel = c.select(b, t, u)       # b∈{0,1} 时输出 b*t+(1-b)*u
 a   = c.assert_equal(m, sel)  # 见证生成时强制两侧相等；输出取左侧
+lk  = c.lookup(x, [0, 5, 10]) # 输出 == x；并约束 x∈{0,5,10}（表长 1..8）
 ```
 
 - 节点按下标顺序追加，**只能引用更早的节点**，故 DAG 天然无环；
@@ -65,6 +101,12 @@ a   = c.assert_equal(m, sel)  # 见证生成时强制两侧相等；输出取左
 - 同一节点下标传给多个父节点即表示**共享子图**；编译时只占一个见证槽。
 - **上限：最多 200 个节点**（`zkcirc.MAX_NODES`）。超出抛
   `CircuitLimitError`，失败的追加不产生任何部分变更。
+- **lookup 表契约**：表必须是 `list/tuple`，长度 **1..8**
+  （`zkcirc.MAX_LOOKUP_TABLE`），元素必须是**规范域元素**（`0..96` 的
+  int；拒绝 bool、负数、`≥97`、float）且**互不重复**。空表、超长、
+  重复或非规范元素在构建期抛 `ValueError`/`TypeError`，且不追加节点。
+  相同表可以在多个 lookup 间重复使用，但每个 lookup 拥有**自己独立的**
+  连乘中间槽，不会错误共享不同 value 的中间见证。
 
 ### 2. 编译：`compile_circuit(circuit) -> CompiledCircuit`
 
@@ -82,7 +124,8 @@ a   = c.assert_equal(m, sel)  # 见证生成时强制两侧相等；输出取左
 - `Constraint(index, node, tag, origin, a, b, c)`：`a/b/c` 均为
   `tuple[(var_index, coeff)]`，按变量下标升序、系数已模 97 规约、
   零系数被剔除。`tag` ∈ `add | mul | select_value | select_booleanity |
-  assert_value | assert_equal`；`origin` 是人读语义说明。
+  lookup_value | lookup_member | assert_value | assert_equal`；`origin` 是
+  人读语义说明。
 - `VariableInfo(slot, role, node, name, kind)`：`role` 为
   `constant_one`（槽 0）、`input` 或 `intermediate`。
 - **常量节点不占见证槽**：在约束中内联为常数槽 0 上的系数。
@@ -94,10 +137,29 @@ a   = c.assert_equal(m, sel)  # 见证生成时强制两侧相等；输出取左
 | `add` | `1 · v = lin(x) + lin(y)` |
 | `mul` | `lin(x) · lin(y) = v` |
 | `select` | `b · (lin(x)−lin(y)) = v−lin(y)` **且** `b·(b−1) = 0` |
+| `lookup` | `1·v = lin(value)`，外加成员连乘乘法门链（见下节） |
 | `assert_equal` | `1 · v = lin(x)` **且** `(lin(x)−lin(y)) · 1 = 0` |
 
 两条 select 约束在域 p=97 上恰好等价于「`b∈{0,1}` 且
 `v = b·x + (1−b)·y`」：布尔性方程在域中只有 0、1 两个解。
+
+#### lookup 的成员连乘门
+
+对表 `T = [t_1, …, t_n]`（`1 ≤ n ≤ 8`），成员条件
+`∏_{k=1..n} (v − t_k) = 0` 在域（整环）上当且仅当 `v` 等于某个 `t_k`。
+编译把连乘拆成 n 条原生乘法门（没有宿主布尔变量）：
+
+| 门 | A | B | C |
+|---|---|---|---|
+| n=1 的唯一门 | `lin(v) − t_1` | `1` | `0` |
+| 第 1 门（n≥2） | `lin(v) − t_1` | `lin(v) − t_2` | `p_2`（中间槽） |
+| 中间门 | `p_{k−1}` | `lin(v) − t_k` | `p_k`（中间槽） |
+| 末门 | `p_n` | `1` | `0` |
+
+表含 n 个元素时分配 **n−1 个** `lookup_aux` 中间槽（`sources` 中
+`kind="lookup_aux"`）。它们与输出槽一样有「输出系数为 1」的定义门，
+固定其他槽后取值唯一，逐槽逐域值篡改测试（见 `tests/test_lookup.py`）
+证实审计必捕获任何伪造中间值，包括把所有连乘槽伪造为 0。
 
 ### 3. 见证生成：`generate_witness(compiled, {"name": int, ...}) -> list[int]`
 
@@ -112,6 +174,7 @@ a   = c.assert_equal(m, sel)  # 见证生成时强制两侧相等；输出取左
 | 未声明的多余输入名 / 非 str 键 | `UnexpectedInputError` / `TypeError` |
 | select 位 ∉ {0,1} | `NonBooleanSelectError`（带节点号与实际 b 值） |
 | assert_equal 不成立 | `AssertEqualError`（带节点号与左右值） |
+| lookup 值不在表内 | `LookupMissError`（带节点号、实际值与表） |
 | 值非 int、bool、NaN、Infinity、其他类型 | `TypeError` / `ValueError` |
 
 ### 4. 审计：`audit(compiled, witness) -> AuditReport`
