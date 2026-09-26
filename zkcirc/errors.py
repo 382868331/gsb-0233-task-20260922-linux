@@ -73,6 +73,31 @@ class AssertEqualError(WitnessError):
         self.right = right
 
 
+class NonBooleanGuardSelectorError(WitnessError):
+    """guarded_equal 的选择位在域内不是 0 或 1。"""
+
+    def __init__(self, node: int, b: int):
+        super().__init__(
+            f"guarded_equal node {node} selector is non-boolean: b={b} "
+            f"(field p=97, only 0/1 allowed)"
+        )
+        self.node = node
+        self.b = b
+
+
+class GuardedEqualError(WitnessError):
+    """guarded_equal 在 selector=1 时两侧不相等。"""
+
+    def __init__(self, node: int, left: int, right: int):
+        super().__init__(
+            f"guarded_equal node {node} failed with selector=1: "
+            f"{left} != {right} (mod 97)"
+        )
+        self.node = node
+        self.left = left
+        self.right = right
+
+
 class UnknownInputError(WitnessError):
     """命名输入缺失（无解），区分于「预算耗尽」。
 

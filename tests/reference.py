@@ -23,6 +23,7 @@ def reference_eval(spec: Sequence[Mapping[str, object]],
 
     - select 的 b 必须为 0/1，否则 ValueError（独立复现契约）。
     - assert_equal 两侧不等则 ValueError，否则输出取左侧。
+    - guarded_equal 的 b 必须为 0/1；仅 b=1 时要求两侧相等，输出取左侧。
     """
 
     values: list[int] = []
@@ -51,6 +52,16 @@ def reference_eval(spec: Sequence[Mapping[str, object]],
             if values[x] != values[y]:
                 raise ValueError(
                     f"assert_equal at node {i}: {values[x]} != {values[y]}"
+                )
+            values.append(values[x])
+        elif kind == "guarded_equal":
+            b, x, y = kids
+            bv = values[b]
+            if bv not in (0, 1):
+                raise ValueError(f"non-boolean guard selector at node {i}: {bv}")
+            if bv == 1 and values[x] != values[y]:
+                raise ValueError(
+                    f"guarded_equal at node {i}: {values[x]} != {values[y]}"
                 )
             values.append(values[x])
         else:

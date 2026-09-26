@@ -1,7 +1,8 @@
 # zkcirc — p=97 算术约束电路的见证生成与审计
 
 一个离线、零第三方依赖的教学型可复用库：在素数域 **p = 97** 上把表达式
-DAG（`add` / `mul` / `const` / `input` / `select` / `assert_equal`）
+DAG（`add` / `mul` / `const` / `input` / `select` / `assert_equal` /
+`guarded_equal`）
 编译为稀疏 **R1CS**（`<A,z>·<B,z> = <C,z> (mod 97)`，`z[0] ≡ 1`），
 生成见证，并对任意见证向量做**逐约束审计**、报告每条失败约束的位置与
 左右侧值。
@@ -18,11 +19,15 @@ DAG（`add` / `mul` / `const` / `input` / `select` / `assert_equal`）
 ## 准确命令
 
 ```bash
+# 可选：创建并激活标准库 venv（无需第三方包）
+python -m venv .venv
+source .venv/bin/activate
+
 # 必要测试（独立参考解释器位于 tests/reference.py，不导入被测核心）
 python -m unittest discover -s tests -v
 
-# 固定输入演示（现场计算，约 0.05 秒，远小于 8 秒；无 sleep、无预录结果）
-python demo.py
+# 本次条件分支固定输入演示（现场计算，通常远小于 90 秒；无 sleep、无预录结果）
+python demo_iteration.py
 ```
 
 ## 目录结构
@@ -37,10 +42,13 @@ tests/
   reference.py       独立参考：朴素域解释器 + 独立点积（不 import zkcirc）
   test_field.py      域工具契约
   test_builder.py    DAG 构建校验与 200 节点上限
-  test_circuit.py    编译/见证/审计：独立解释器对照、非布尔 select、
-                     共享子图、中间值篡改、未知输入、稀疏格式
+  test_circuit.py    基线编译/见证/审计：非布尔 select、共享子图、
+                     中间值篡改、未知输入、稀疏格式
+  test_guarded.py    guarded_equal：独立参考、条件逆元、selector=2、
+                     选中值/非选中值篡改
   test_soundness.py  确定性穷举：全部 97 个域值的单点篡改检测
-demo.py            固定输入演示
+demo.py            基线固定输入演示
+demo_iteration.py  本次条件分支固定输入演示
 ```
 
 ## 公开接口
@@ -58,6 +66,7 @@ s   = c.add(x, y)             # 加法
 m   = c.mul(s, k)             # 乘法；节点 s 被共享时只分配一个见证槽
 sel = c.select(b, t, u)       # b∈{0,1} 时输出 b*t+(1-b)*u
 a   = c.assert_equal(m, sel)  # 见证生成时强制两侧相等；输出取左侧
+g   = c.guarded_equal(b, m, sel) # 仅 b=1 时强制 m=sel；输出始终取 m
 ```
 
 - 节点按下标顺序追加，**只能引用更早的节点**，故 DAG 天然无环；
@@ -82,7 +91,8 @@ a   = c.assert_equal(m, sel)  # 见证生成时强制两侧相等；输出取左
 - `Constraint(index, node, tag, origin, a, b, c)`：`a/b/c` 均为
   `tuple[(var_index, coeff)]`，按变量下标升序、系数已模 97 规约、
   零系数被剔除。`tag` ∈ `add | mul | select_value | select_booleanity |
-  assert_value | assert_equal`；`origin` 是人读语义说明。
+  assert_value | assert_equal | guarded_value | guarded_booleanity |
+  guarded_equal`；`origin` 是人读语义说明。
 - `VariableInfo(slot, role, node, name, kind)`：`role` 为
   `constant_one`（槽 0）、`input` 或 `intermediate`。
 - **常量节点不占见证槽**：在约束中内联为常数槽 0 上的系数。
@@ -95,9 +105,15 @@ a   = c.assert_equal(m, sel)  # 见证生成时强制两侧相等；输出取左
 | `mul` | `lin(x) · lin(y) = v` |
 | `select` | `b · (lin(x)−lin(y)) = v−lin(y)` **且** `b·(b−1) = 0` |
 | `assert_equal` | `1 · v = lin(x)` **且** `(lin(x)−lin(y)) · 1 = 0` |
+| `guarded_equal` | `1 · v = lin(x)`、`b·(b−1)=0` **且** `b·(lin(x)−lin(y))=0` |
 
 两条 select 约束在域 p=97 上恰好等价于「`b∈{0,1}` 且
 `v = b·x + (1−b)·y`」：布尔性方程在域中只有 0、1 两个解。
+
+`guarded_equal` 会为自身输出 `v=x` 分配一个普通中间槽。无论 `b=0` 还是
+`b=1`，该槽都在见证生成时明确赋为左操作数；不会留下未初始化槽位。三条
+约束分别给出输出来源、selector 布尔性和条件等式：`b=0` 时最后一条的左
+因子为 0，因此只属于开启分支的等式不生效；`b=1` 时退化为 `x-y=0`。
 
 ### 3. 见证生成：`generate_witness(compiled, {"name": int, ...}) -> list[int]`
 
@@ -112,6 +128,8 @@ a   = c.assert_equal(m, sel)  # 见证生成时强制两侧相等；输出取左
 | 未声明的多余输入名 / 非 str 键 | `UnexpectedInputError` / `TypeError` |
 | select 位 ∉ {0,1} | `NonBooleanSelectError`（带节点号与实际 b 值） |
 | assert_equal 不成立 | `AssertEqualError`（带节点号与左右值） |
+| guarded_equal 位 ∉ {0,1} | `NonBooleanGuardSelectorError` |
+| guarded_equal 在 b=1 时不成立 | `GuardedEqualError` |
 | 值非 int、bool、NaN、Infinity、其他类型 | `TypeError` / `ValueError` |
 
 ### 4. 审计：`audit(compiled, witness) -> AuditReport`
@@ -160,16 +178,20 @@ a   = c.assert_equal(m, sel)  # 见证生成时强制两侧相等；输出取左
 2. **常量不占槽**：减少见证宽度；常量在约束矩阵中内联为常数槽系数。
 3. **select 不引入辅助见证**：两条约束（选择式 + 布尔性）即完备，
    避免了无法写成线性 C 的二次辅助定义式。
-4. **审计与见证生成分离**：`audit` 接受任何向量（包括被篡改的向量），
+4. **guarded_equal 不改变见证求值模型**：其输出是左操作数的普通中间槽，
+   条件等式以 `b*(x-y)=0` 进入 R1CS；关闭分支的见证仍明确赋值，但不额外
+   施加只有开启分支才应存在的等式（例如 `x*inv=1` 逆元要求）。
+5. **审计与见证生成分离**：`audit` 接受任何向量（包括被篡改的向量），
    因此既能验证合法见证，也能对伪造/损坏见证做逐条法医式定位。
-5. **域固定为 p=97**：不做通用曲线/通用域参数化（题目明确固定 p=97）。
+6. **域固定为 p=97**：不做通用曲线/通用域参数化（题目明确固定 p=97）。
 
 ## 已知限制
 
 - R1CS 约束的是变量**关系**，不保证每个输入都能从其余见证唯一反推：
   例如纯 `x*x` 电路无法区分 `x` 与 `−x (mod 97)`；`b=0` 的 `select`
-  不约束未选分支。这是 R1CS 的标准关系语义，**中间槽**仍被其定义约束
-  唯一钉住（已穷举验证），但输入唯一性需由电路设计者通过断言保证。
+  和 `guarded_equal` 有意不约束未选分支内容。这是条件分支的目标语义：
+  关闭分支的见证槽仍会明确赋值并受自身定义约束，但不会触发仅开启分支
+  要求的等式；若要额外限制关闭分支输入，应由电路设计者另加约束。
 - **完全没有消费者的输入节点不出现在任何约束中**（标准 R1CS 行为），
   审计无法约束其值；需要约束某个输入时让它参与计算或 `assert_equal`。
 - 不做 Witness 之外的证明系统、不做序列化/文件格式、不做电路优化
