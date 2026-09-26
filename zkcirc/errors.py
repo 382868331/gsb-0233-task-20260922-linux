@@ -40,16 +40,16 @@ class WitnessError(ZkCircError):
 
 
 class NonBooleanSelectError(WitnessError):
-    """select 的选择位 b 在域内不是 0 或 1。
+    """select / guarded_assert 的选择位 b 在域内不是 0 或 1。
 
     属性:
-        node: 触发问题的 select 节点索引。
+        node: 触发问题的节点索引。
         b: 实际域值（0..p-1 的 int）。
     """
 
     def __init__(self, node: int, b: int):
         super().__init__(
-            f"select node {node} selector is non-boolean: b={b} (field p=97, "
+            f"node {node} selector is non-boolean: b={b} (field p=97, "
             f"only 0/1 allowed)"
         )
         self.node = node
@@ -69,6 +69,29 @@ class AssertEqualError(WitnessError):
             f"assert_equal node {node} failed: {left} != {right} (mod 97)"
         )
         self.node = node
+        self.left = left
+        self.right = right
+
+
+class GuardedAssertError(WitnessError):
+    """guarded_assert 在选择位为 1 时两侧值不相等（守卫触发）。
+
+    选择位为 0 时该等式不生效，不会抛本异常；选择位非 0/1 时由
+    NonBooleanSelectError 报告。
+
+    属性:
+        node: guarded_assert 节点索引。
+        selector: 实际选择位域值（恒为 1，保留以便定位）。
+        left, right: 两侧实际域值。
+    """
+
+    def __init__(self, node: int, selector: int, left: int, right: int):
+        super().__init__(
+            f"guarded_assert node {node} failed: guard active (b={selector}) "
+            f"but {left} != {right} (mod 97)"
+        )
+        self.node = node
+        self.selector = selector
         self.left = left
         self.right = right
 

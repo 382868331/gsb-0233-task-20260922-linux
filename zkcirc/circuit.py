@@ -30,6 +30,7 @@ from .errors import (
     UnexpectedInputError,
     NonBooleanSelectError,
     AssertEqualError,
+    GuardedAssertError,
 )
 
 MAX_NODES = 200
@@ -40,8 +41,9 @@ _ADD = "add"
 _MUL = "mul"
 _SELECT = "select"
 _ASSERT = "assert_equal"
+_GUARD = "guarded_assert"
 
-_VALID_KINDS = frozenset({_CONST, _INPUT, _ADD, _MUL, _SELECT, _ASSERT})
+_VALID_KINDS = frozenset({_CONST, _INPUT, _ADD, _MUL, _SELECT, _ASSERT, _GUARD})
 # 每种节点的子节点引用个数。
 _ARITY = {
     _CONST: 0,
@@ -50,6 +52,7 @@ _ARITY = {
     _MUL: 2,
     _SELECT: 3,
     _ASSERT: 2,
+    _GUARD: 3,
 }
 
 
@@ -68,6 +71,8 @@ class Node:
         - "add"/"mul":    二元算术，inputs=(x, y) 为被引用节点的下标
         - "select":       inputs=(b, x, y)，b 非 0/1 时见证生成失败
         - "assert_equal": inputs=(x, y)，x!=y 时见证生成失败；输出值取 x
+        - "guarded_assert": inputs=(b, x, y)，b 必须为 0/1；等式 x==y 仅在
+          b=1 时生效（b=1 且 x!=y 时见证生成失败）；输出值取 x
     """
 
     kind: str
@@ -213,6 +218,19 @@ class Circuit:
         self._check_ref(x, "assert_equal x")
         self._check_ref(y, "assert_equal y")
         return self._append(Node(_ASSERT, inputs=(x, y)))
+
+    def guarded_assert(self, b: int, x: int, y: int) -> int:
+        """追加 guarded_assert(b,x,y) 节点：b=1 时要求 x==y (mod 97)。
+
+        b 必须为 0/1（与 select 同一套布尔性约束）；b=0 时等式不生效，
+        但 x、y 两支的见证槽仍按 DAG 正常求值，不留未初始化槽。
+        输出值取 x（与 assert_equal 一致）。
+        """
+
+        self._check_ref(b, "guarded_assert b")
+        self._check_ref(x, "guarded_assert x")
+        self._check_ref(y, "guarded_assert y")
+        return self._append(Node(_GUARD, inputs=(b, x, y)))
 
     # -- 内部 ---------------------------------------------------------------
 
@@ -378,6 +396,24 @@ def compile_circuit(circuit: Circuit) -> CompiledCircuit:
             emit(i, "assert_equal",
                  f"assert_equal node {i}: x - y = 0",
                  merge((lin(x), 1), (lin(y), -1)), {0: 1}, {})
+        elif node.kind == _GUARD:
+            b, x, y = node.inputs
+            v = slot_of[i]
+            lb = lin(b)
+            # 输出槽定义：1 * v = lin(x)（两支见证槽均正常赋值）
+            emit(i, "guarded_value",
+                 f"guarded_assert node {i}: output v takes left operand",
+                 {0: 1}, {v: 1}, lin(x))
+            # 守卫等式：lin(b) * (lin(x) - lin(y)) = 0
+            # 仅当 b=1 时强制 x==y；b=0 时该约束恒成立（不生效）。
+            emit(i, "guarded_equal",
+                 f"guarded_assert node {i}: b*(x-y) = 0 (active iff b=1)",
+                 lb, merge((lin(x), 1), (lin(y), -1)), {})
+            # 布尔性：b * (b - 1) = 0 —— 选择位必须被约束为 0 或 1，
+            # 否则 b=2 等非布尔值可插值绕过守卫条件。
+            emit(i, "guarded_booleanity",
+                 f"guarded_assert node {i}: b*(b-1) = 0 (boolean selector)",
+                 lb, merge((lb, 1), ({0: 1}, -1)), {})
 
     return CompiledCircuit(
         p=P,
@@ -412,6 +448,8 @@ def generate_witness(compiled: CompiledCircuit,
       - 输入值非 int 有限标量（bool / NaN / Infinity 等）: TypeError/ValueError
       - select 选择位非布尔: NonBooleanSelectError
       - assert_equal 不成立: AssertEqualError
+      - guarded_assert 选择位非布尔: NonBooleanSelectError；
+        选择位为 1 且两侧不等: GuardedAssertError
 
     中间槽全部由本函数按 DAG 重新计算，调用方无法通过 user_inputs 覆盖。
     """
@@ -473,6 +511,14 @@ def generate_witness(compiled: CompiledCircuit,
             if bv not in (0, 1):
                 raise NonBooleanSelectError(i, bv)
             v = (bv * xv + (1 - bv) * yv) % P
+        elif node.kind == _GUARD:
+            b, x, y = node.inputs
+            bv = vals[b]
+            if bv not in (0, 1):
+                raise NonBooleanSelectError(i, bv)
+            if bv == 1 and vals[x] != vals[y]:
+                raise GuardedAssertError(i, bv, vals[x], vals[y])
+            v = vals[x]
         else:  # assert_equal
             x, y = node.inputs
             if vals[x] != vals[y]:
